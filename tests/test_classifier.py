@@ -68,6 +68,57 @@ def test_build_classifier_no_negatives_still_trains():
     assert "unknown" in names
 
 
+def test_build_classifier_uses_all_negatives_by_default(monkeypatch):
+    refs = {"cat": CAT_REFS[:1]}
+    seen = []
+
+    def embed(asset_id, require_animal=False):
+        seen.append(asset_id)
+        return _mock_embed(asset_id, require_animal)
+
+    monkeypatch.delenv("NEGATIVE_SAMPLE_LIMIT", raising=False)
+    with patch("classifier.emb.embed_asset_crops", side_effect=embed), \
+         patch("classifier.emb.embed_crop_by_bbox", return_value=None):
+        result = clf_mod.build_classifier(["cat"], refs, NEG_IDS)
+
+    assert result is not None
+    assert [asset_id for asset_id in seen if asset_id.startswith("neg_")] == NEG_IDS
+
+
+def test_build_classifier_can_limit_negatives(monkeypatch):
+    refs = {"cat": CAT_REFS[:1]}
+    seen = []
+
+    def embed(asset_id, require_animal=False):
+        seen.append(asset_id)
+        return _mock_embed(asset_id, require_animal)
+
+    monkeypatch.setenv("NEGATIVE_SAMPLE_LIMIT", "5")
+    with patch("classifier.emb.embed_asset_crops", side_effect=embed), \
+         patch("classifier.emb.embed_crop_by_bbox", return_value=None):
+        result = clf_mod.build_classifier(["cat"], refs, NEG_IDS)
+
+    assert result is not None
+    assert len([asset_id for asset_id in seen if asset_id.startswith("neg_")]) == 5
+
+
+def test_build_classifier_embeds_crop_level_negatives():
+    refs = {"cat": CAT_REFS[:2]}
+    crop_calls = []
+
+    def embed_crop(asset_id, bbox):
+        crop_calls.append((asset_id, bbox))
+        return NEG_VECS[0]
+
+    negative_refs = [{"asset_id": "neg_crop", "crop_idx": 0, "bbox": [0.1, 0.2, 0.3, 0.4]}]
+    with patch("classifier.emb.embed_asset_crops", side_effect=_mock_embed), \
+         patch("classifier.emb.embed_crop_by_bbox", side_effect=embed_crop):
+        result = clf_mod.build_classifier(["cat"], refs, negative_refs)
+
+    assert result is not None
+    assert crop_calls == [("neg_crop", [0.1, 0.2, 0.3, 0.4])]
+
+
 def test_build_classifier_skips_missing_embeddings():
     refs = {"cat": [{"asset_id": "missing"}]}
     with patch("classifier.emb.embed_asset_crops", return_value=[]), \
@@ -105,6 +156,13 @@ def test_classify_returns_float_prob(two_pet_classifier):
     _, prob = clf_mod.classify(CAT_VECS[0], names, clf, scaler)
     assert isinstance(prob, float)
     assert 0.0 <= prob <= 1.0
+
+
+def test_score_breakdown_is_sorted(two_pet_classifier):
+    names, clf, scaler = two_pet_classifier
+    scores = clf_mod.score_breakdown(CAT_VECS[0], names, clf, scaler)
+    assert scores[0]["score"] >= scores[1]["score"]
+    assert {s["name"] for s in scores} == set(names)
 
 
 # ---------------------------------------------------------------------------

@@ -32,8 +32,8 @@ log = logging.getLogger("api")
 
 router = APIRouter(prefix="/api")
 
-IMMICH_EXTERNAL_URL = os.environ.get("IMMICH_EXTERNAL_URL", "http://localhost:2283")
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+IMMICH_EXTERNAL_URL = os.environ.get("IMMICH_EXTERNAL_URL", os.environ.get("IMMICH_URL", "http://127.0.0.1:2283"))
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/var/lib/immich-pet-tagger"))
 PETS_DIR = DATA_DIR / "pets"
 LONG_REQUEST_TIMEOUT = int(os.environ.get("LONG_REQUEST_TIMEOUT", 120))
 KEEPALIVE_INTERVAL = 15
@@ -89,14 +89,29 @@ class PetCropAssets(BaseModel):
     assets: Optional[list[CropRef]] = None  # crop-centric format
 
 
-_VERSION_FILE = Path(__file__).parent / "VERSION"
+def _read_version() -> str:
+    env_version = os.environ.get("APP_VERSION")
+    if env_version and env_version.strip():
+        return env_version.strip()
+
+    for package_json_file in (
+        Path(__file__).resolve().parent.parent / "package.json",
+        Path(__file__).with_name("package.json"),
+    ):
+        try:
+            package_json = json.loads(package_json_file.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+        version = package_json.get("version")
+        if version:
+            return str(version)
+
+    return "unknown"
+
 
 @router.get("/version")
 async def get_version():
-    try:
-        return {"version": _VERSION_FILE.read_text().strip()}
-    except FileNotFoundError:
-        return {"version": "unknown"}
+    return {"version": _read_version()}
 
 
 @router.get("/config")
@@ -111,7 +126,7 @@ async def get_config():
 @router.get("/settings")
 async def get_settings():
     """Env-var-configured defaults (THRESHOLD, YOLO_CONF). Read-only: production config
-    lives in docker-compose.yml only. Used to prefill the benchmark tool's per-run
+    should be set through the NixOS module. Used to prefill the benchmark tool's per-run
     threshold overrides, which are never persisted, they only apply to that one run."""
     from poller import THRESHOLD
     return {"threshold": THRESHOLD, "yolo_conf": det.YOLO_CONF}
@@ -345,16 +360,39 @@ async def delete_pet(name: str, local_only: bool = False):
 
 @router.get("/negatives")
 async def get_negatives():
-    ids = data.load_negative_ids(DATA_DIR)
-    return {"assets": [{"id": aid, "thumb": f"/api/thumb/{aid}"} for aid in ids], "count": len(ids)}
+    refs = data.load_negative_refs(DATA_DIR)
+
+    def make_item(ref: dict) -> dict:
+        aid = ref["asset_id"]
+        bbox = ref.get("bbox")
+        if bbox:
+            thumb = f"/api/crop/{aid}?bbox={','.join(str(v) for v in bbox)}"
+        else:
+            thumb = f"/api/thumb/{aid}"
+        ui_key = f"{aid}_{ref['crop_idx']}" if ref.get("crop_idx") is not None else aid
+        return {
+            "id": aid,
+            "key": ui_key,
+            "crop_idx": ref.get("crop_idx"),
+            "bbox": bbox,
+            "thumb": thumb,
+        }
+
+    return {"assets": [make_item(ref) for ref in refs], "count": len(refs)}
 
 
 @router.post("/negatives")
 async def add_negatives(body: PetAssets):
-    existing = set(data.load_negative_ids(DATA_DIR))
-    merged = list(existing | set(body.asset_ids))
-    data.save_negative_ids(merged, DATA_DIR)
-    log.info(f"Negatives: {len(merged)} total (+{len(set(body.asset_ids) - existing)} new)")
+    existing_refs = data.load_negative_refs(DATA_DIR)
+    existing_ids = set(data.load_negative_ids(DATA_DIR))
+    merged = data.merge_crop_refs([*existing_refs, *body.asset_ids])
+    data.save_negative_refs(merged, DATA_DIR)
+    remove_ids = set(body.asset_ids)
+    state.scan_review_assets = [
+        item for item in (state.scan_review_assets or [])
+        if item.get("asset_id") not in remove_ids
+    ]
+    log.info(f"Reject samples: {len(merged)} total (+{len(set(body.asset_ids) - existing_ids)} new asset-level)")
     return {"ok": True, "count": len(merged)}
 
 
@@ -372,14 +410,14 @@ async def clear_pet_refs(name: str):
 @router.delete("/negatives/all")
 async def clear_all_negatives():
     data.save_negative_ids([], DATA_DIR)
-    log.info("Cleared all negatives (local only)")
+    log.info("Cleared all reject samples (local only)")
     return {"ok": True}
 
 
 @router.delete("/negatives/{asset_id}")
 async def remove_negative(asset_id: str):
-    ids = [i for i in data.load_negative_ids(DATA_DIR) if i != asset_id]
-    data.save_negative_ids(ids, DATA_DIR)
+    refs = [r for r in data.load_negative_refs(DATA_DIR) if r["asset_id"] != asset_id]
+    data.save_negative_refs(refs, DATA_DIR)
     return {"ok": True}
 
 
@@ -392,6 +430,11 @@ async def add_skipped(body: PetAssets):
     existing = set(data.load_skipped_ids(DATA_DIR))
     merged = list(existing | set(body.asset_ids))
     data.save_skipped_ids(merged, DATA_DIR)
+    remove_ids = set(body.asset_ids)
+    state.scan_review_assets = [
+        item for item in (state.scan_review_assets or [])
+        if item.get("asset_id") not in remove_ids
+    ]
     return {"count": len(merged)}
 
 
@@ -535,12 +578,12 @@ async def remove_pet_asset(name: str, asset_id: str, crop_idx: Optional[int] = N
 # Ref suggestions
 # ---------------------------------------------------------------------------
 
-def _classifier_fingerprint(pet_names: list[str], refs_per_pet: dict, negative_ids: list[str]) -> str:
+def _classifier_fingerprint(pet_names: list[str], refs_per_pet: dict, negative_refs: list) -> str:
     """Stable hash of the inputs that define a trained classifier."""
     parts = []
     for name in sorted(pet_names):
-        parts.append(name + ":" + ",".join(sorted(r["asset_id"] for r in refs_per_pet[name])))
-    parts.append("neg:" + ",".join(sorted(negative_ids)))
+        parts.append(name + ":" + ",".join(sorted(data.crop_ref_key(r) for r in refs_per_pet[name])))
+    parts.append("neg:" + ",".join(sorted(data.crop_ref_key(r) for r in data.merge_crop_refs(negative_refs))))
     return hashlib.md5("\n".join(parts).encode()).hexdigest()
 
 
@@ -555,7 +598,7 @@ def _build_classifier_from_config(config: dict):
     all_refs = {n: data.load_pet_refs(config[n].get("person_id") or n, DATA_DIR) for n in all_pet_names}
     pet_names = [n for n in all_pet_names if all_refs.get(n)]
     refs_per_pet = {n: all_refs[n] for n in pet_names}
-    negative_ids = data.load_negative_ids(DATA_DIR)
+    negative_ids = data.load_negative_refs(DATA_DIR)
 
     fp = _classifier_fingerprint(pet_names, refs_per_pet, negative_ids)
     with state.classifier_cache_lock:
@@ -585,7 +628,7 @@ async def get_suggestions(name: str, limit: int = 20):
 
     ref_ids = data.load_pet_asset_ids(pet_cfg.get("person_id") or name, DATA_DIR)
     ref_set = set(ref_ids)
-    neg_ids = set(data.load_negative_ids(DATA_DIR))
+    neg_ids = set(data.load_negative_asset_ids(DATA_DIR))
     exclude = ref_set | neg_ids
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -655,7 +698,7 @@ async def get_borderline(name: str, limit: int = 40):
         raise HTTPException(status_code=400, detail="no_refs")
 
     ref_set = set(ref_ids)
-    neg_ids = set(data.load_negative_ids(DATA_DIR))
+    neg_ids = set(data.load_negative_asset_ids(DATA_DIR))
     skipped_ids = set(data.load_skipped_ids(DATA_DIR))
     exclude = ref_set | neg_ids | skipped_ids
 
@@ -740,7 +783,7 @@ async def start_benchmark(body: BenchmarkRequest):
     """Diagnostic, not part of the tagging pipeline: dry-run classify every asset (photo
     and video) in the given date range and compare against the actual Immich tags (source
     of truth). Runs in the background since a full library can take several minutes; poll
-    GET /analysis/benchmark for progress and the result. See accuracy.html.
+    GET /analysis/benchmark for progress and the result.
 
     Immich's tags in the range are treated as ground truth, so the caller is responsible
     for making sure every asset in range has already been manually tagged and corrected
@@ -749,7 +792,7 @@ async def start_benchmark(body: BenchmarkRequest):
     No CLIP threshold is taken here: unlike yolo_conf (which changes what gets embedded,
     so it has to be fixed before running), a CLIP threshold is just a cutoff compared
     against scores already collected, so it's explored entirely client-side afterward
-    (see result['curve'] and accuracy.html's threshold explorer) with no re-run needed."""
+    (see result['curve']) with no re-run needed."""
     import re
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", body.since):
         raise HTTPException(status_code=400, detail="since must be YYYY-MM-DD")
@@ -782,7 +825,7 @@ async def get_benchmark():
 
 @router.post("/analysis/benchmark/result")
 async def set_benchmark_result(body: dict):
-    """Store an externally-provided result (e.g. a file re-imported in accuracy.html) as
+    """Store an externally-provided result as
     the current one, so /download can serve it back too, not just freshly-run results."""
     state.benchmark_result = body
     return {"status": "ok"}
@@ -953,7 +996,7 @@ async def get_neg_candidates(limit: int = 60):
     all_pet_names = list(config.keys())
     all_refs = {n: data.load_pet_refs(config[n].get("person_id") or n, DATA_DIR) for n in all_pet_names}
     all_ref_ids: set[str] = {r["asset_id"] for refs in all_refs.values() for r in refs}
-    neg_ids = set(data.load_negative_ids(DATA_DIR))
+    neg_ids = set(data.load_negative_asset_ids(DATA_DIR))
     skipped_ids = set(data.load_skipped_ids(DATA_DIR))
     exclude = all_ref_ids | neg_ids | skipped_ids
 
@@ -1110,6 +1153,14 @@ async def import_pet(body: PetImport):
 class ScanRequest(BaseModel):
     scan_since: str
     scan_until: Optional[str] = None
+    review: bool = True
+
+
+class ScanReviewApply(BaseModel):
+    assets: list[CropRef]
+    pet_names: list[str] = []
+    negative: bool = False
+    reject: bool = False
 
 
 @router.post("/scan")
@@ -1121,7 +1172,7 @@ async def trigger_scan(body: ScanRequest):
     if state.scan_lock is not None and state.scan_lock.locked():
         state.scan_cancel.set()
     state.scan_generation += 1
-    asyncio.create_task(_run_manual_scan(state.scan_generation, body.scan_since, body.scan_until))
+    asyncio.create_task(_run_manual_scan(state.scan_generation, body.scan_since, body.scan_until, body.review))
     return {"status": "started"}
 
 
@@ -1132,15 +1183,22 @@ async def stop_scan():
         state.scan_cancel.set()
         state.scan_generation += 1
         state.manual_scan_result = {"status": "stopped", "ran_at": datetime.now(timezone.utc).isoformat()}
+        state.scan_review_assets = []
     return {"status": "stopped"}
 
 
-async def _run_manual_scan(generation: int, scan_since: str, scan_until: str | None = None):
+async def _run_manual_scan(generation: int, scan_since: str, scan_until: str | None = None, review_only: bool = True):
     import state
     import inference
     live_counts: dict = {}
-    state.manual_scan_result = {"status": "running", "started_at": datetime.now(timezone.utc).isoformat(), "counts": live_counts}
+    state.manual_scan_result = {
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "counts": live_counts,
+        "review": review_only,
+    }
     state.scan_low_conf_assets = []
+    state.scan_review_assets = []
     scan_since_iso = scan_since + "T00:00:00.000Z"
 
     def on_date(date_str):
@@ -1156,17 +1214,71 @@ async def _run_manual_scan(generation: int, scan_since: str, scan_until: str | N
             if state.scan_generation != generation:
                 return
             state.scan_cancel.clear()
-            counts, low_conf_assets = await asyncio.to_thread(
+            counts, low_conf_assets, review_assets = await asyncio.to_thread(
                 inference.run_scan, str(DATA_DIR),
                 manual=True, scan_until=scan_until, scan_since=scan_since_iso,
                 cancel=state.scan_cancel, on_date=on_date, on_counts=on_counts,
+                review_only=review_only,
             )
             if state.scan_generation == generation:
                 state.scan_low_conf_assets = low_conf_assets
+                state.scan_review_assets = review_assets
                 state.manual_scan_result = data.load_poll_status(DATA_DIR)
+                state.manual_scan_result["review"] = review_only
     except Exception as e:
         if state.scan_generation == generation:
             state.manual_scan_result = {"status": "error", "error": str(e), "ran_at": datetime.now(timezone.utc).isoformat()}
+
+
+def _crop_key(asset_id: str, crop_idx=None, bbox=None) -> str:
+    return data.crop_key(asset_id, crop_idx, bbox)
+
+
+def _review_item_key(item: dict) -> str:
+    return _crop_key(item["asset_id"], item.get("crop_idx"), item.get("bbox"))
+
+
+def _crop_ref_key(ref: CropRef) -> str:
+    return _crop_key(ref.asset_id, ref.crop_idx, ref.bbox)
+
+
+def _filtered_scan_review_assets() -> list[dict]:
+    skipped = set(data.load_skipped_ids(DATA_DIR)) | set(data.load_negative_asset_ids(DATA_DIR))
+    negative_crop_keys = {
+        key
+        for ref in data.load_negative_refs(DATA_DIR)
+        if not data.is_asset_level_ref(ref)
+        for key in data.crop_ref_match_keys(ref)
+    }
+    seen: set[str] = set()
+    assets: list[dict] = []
+    for item in state.scan_review_assets or []:
+        aid = item["asset_id"]
+        if aid in skipped:
+            continue
+        item_keys = data.crop_ref_match_keys({
+            "asset_id": aid,
+            "crop_idx": item.get("crop_idx"),
+            "bbox": item.get("bbox"),
+        })
+        if item_keys & negative_crop_keys:
+            continue
+        key = _review_item_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        assets.append(item)
+    return assets
+
+
+def _remove_scan_review_assets(refs: list[CropRef]) -> None:
+    remove = {_crop_ref_key(ref) for ref in refs}
+    if not remove:
+        return
+    state.scan_review_assets = [
+        item for item in (state.scan_review_assets or [])
+        if _review_item_key(item) not in remove
+    ]
 
 
 @router.get("/scan/result")
@@ -1174,31 +1286,164 @@ async def get_scan_result():
     result = state.manual_scan_result
     if not result:
         return {"status": "none"}
-    skipped = set(data.load_skipped_ids(DATA_DIR)) | set(data.load_negative_ids(DATA_DIR))
-    filtered_count = len({a["asset_id"] for a in (state.scan_low_conf_assets or []) if a["asset_id"] not in skipped})
-    counts = {**result.get("counts", {}), "low_confidence": filtered_count}
+    skipped = set(data.load_skipped_ids(DATA_DIR)) | set(data.load_negative_asset_ids(DATA_DIR))
+    negative_crop_keys = {
+        key
+        for ref in data.load_negative_refs(DATA_DIR)
+        if not data.is_asset_level_ref(ref)
+        for key in data.crop_ref_match_keys(ref)
+    }
+    filtered_low_conf = []
+    for a in state.scan_low_conf_assets or []:
+        if a["asset_id"] in skipped:
+            continue
+        item_keys = data.crop_ref_match_keys({
+            "asset_id": a["asset_id"],
+            "crop_idx": a.get("crop_idx"),
+            "bbox": a.get("bbox"),
+        })
+        if item_keys & negative_crop_keys:
+            continue
+        filtered_low_conf.append(a)
+    filtered_count = len({_review_item_key(a) for a in filtered_low_conf})
+    review_count = len(_filtered_scan_review_assets())
+    counts = {**result.get("counts", {}), "low_confidence": filtered_count, "review": review_count}
     return {**result, "counts": counts}
+
+
+@router.get("/scan/review")
+async def get_scan_review():
+    from poller import THRESHOLD
+    config = data.load_config(DATA_DIR)
+
+    def make_item(a: dict) -> dict:
+        aid = a["asset_id"]
+        bbox = a.get("bbox")
+        thumb = f"/api/crop/{aid}?bbox={','.join(str(v) for v in bbox)}" if bbox else f"/api/crop/{aid}"
+        return {
+            "id": aid,
+            "thumb": thumb,
+            "bbox": bbox,
+            "crop_idx": a.get("crop_idx"),
+            "pet_name": a["pet_name"],
+            "score": a["prob"],
+            "scores": a.get("scores", []),
+            "score_margin": a.get("score_margin"),
+            "unknown_score": a.get("unknown_score"),
+            "runner_up_score": a.get("runner_up_score"),
+            "detection_conf": a.get("detection_conf"),
+            "threshold": a.get("threshold"),
+            "fallback": a.get("fallback", False),
+            "date": a.get("date", ""),
+            "outcome": a.get("outcome", "confident"),
+        }
+
+    assets = sorted(
+        _filtered_scan_review_assets(),
+        key=lambda a: (a.get("date", ""), a.get("asset_id", ""), a.get("crop_idx") if a.get("crop_idx") is not None else -1),
+    )
+    return {
+        "assets": [make_item(a) for a in assets],
+        "pets": list(config.keys()),
+        "threshold": THRESHOLD,
+    }
+
+
+@router.post("/scan/review/apply")
+async def apply_scan_review(body: ScanReviewApply):
+    if not body.assets:
+        raise HTTPException(status_code=400, detail="No assets selected")
+
+    if body.negative or body.reject:
+        reject_refs = [asset.model_dump(exclude_none=True) for asset in body.assets]
+        existing_refs = data.load_negative_refs(DATA_DIR)
+        existing_keys = {data.crop_ref_key(r) for r in existing_refs}
+        merged = data.merge_crop_refs([*existing_refs, *reject_refs])
+        data.save_negative_refs(merged, DATA_DIR)
+        _remove_scan_review_assets(body.assets)
+        added_rejects = len({data.crop_ref_key(r) for r in data.merge_crop_refs(reject_refs)} - existing_keys)
+        log.info(f"Scan review: added {added_rejects} reject samples")
+        return {"ok": True, "negative": len(reject_refs), "reject": len(reject_refs), "added": 0, "already_tagged": 0, "failed": 0}
+
+    pet_names = list(dict.fromkeys(n for n in body.pet_names if n))
+    if not pet_names:
+        raise HTTPException(status_code=400, detail="Select at least one pet")
+
+    config = data.load_config(DATA_DIR)
+    missing = [name for name in pet_names if name not in config]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Unknown pet: {', '.join(missing)}")
+
+    person_by_pet: dict[str, str] = {}
+    for name in pet_names:
+        person_id = config[name].get("person_id")
+        if not person_id:
+            raise HTTPException(status_code=400, detail=f"Pet '{name}' has no Immich person_id")
+        person_by_pet[name] = person_id
+
+    added = already_tagged = failed = 0
+    existing_cache: dict[str, set[str]] = {}
+    async with httpx.AsyncClient(timeout=30) as client:
+        for asset in body.assets:
+            existing_persons = existing_cache.get(asset.asset_id)
+            if existing_persons is None:
+                existing_persons = await imm.get_existing_face_person_ids(client, asset.asset_id)
+                existing_cache[asset.asset_id] = existing_persons
+            for pet_name in pet_names:
+                person_id = person_by_pet[pet_name]
+                if person_id in existing_persons:
+                    already_tagged += 1
+                    continue
+                face_id = await imm.post_face(client, asset.asset_id, person_id, asset.bbox)
+                if face_id:
+                    added += 1
+                    existing_persons.add(person_id)
+                else:
+                    failed += 1
+
+    if failed == 0:
+        _remove_scan_review_assets(body.assets)
+    log.info(f"Scan review applied: pets={pet_names} assets={len(body.assets)} added={added} already={already_tagged} failed={failed}")
+    return {"ok": True, "added": added, "already_tagged": already_tagged, "failed": failed, "negative": 0}
 
 
 @router.get("/scan/low-confidence")
 async def get_scan_low_confidence():
     from poller import THRESHOLD
     config = data.load_config(DATA_DIR)
-    skipped = set(data.load_skipped_ids(DATA_DIR)) | set(data.load_negative_ids(DATA_DIR))
+    skipped = set(data.load_skipped_ids(DATA_DIR)) | set(data.load_negative_asset_ids(DATA_DIR))
+    negative_crop_keys = {
+        key
+        for ref in data.load_negative_refs(DATA_DIR)
+        if not data.is_asset_level_ref(ref)
+        for key in data.crop_ref_match_keys(ref)
+    }
     seen: dict = {}
     for a in (state.scan_low_conf_assets or []):
         aid = a["asset_id"]
         if aid in skipped:
             continue
-        if aid not in seen or a["prob"] > seen[aid]["prob"]:
-            seen[aid] = a
+        item_keys = data.crop_ref_match_keys({
+            "asset_id": aid,
+            "crop_idx": a.get("crop_idx"),
+            "bbox": a.get("bbox"),
+        })
+        if item_keys & negative_crop_keys:
+            continue
+        key = _review_item_key(a)
+        if key not in seen or a["prob"] > seen[key]["prob"]:
+            seen[key] = a
     sorted_assets = sorted(seen.values(), key=lambda a: a["prob"])
     def make_item(a: dict) -> dict:
         aid = a["asset_id"]
         bbox = a.get("bbox")
         thumb = f"/api/crop/{aid}?bbox={','.join(str(v) for v in bbox)}" if bbox else f"/api/crop/{aid}"
-        return {"id": aid, "thumb": thumb, "bbox": bbox,
-                "pet_name": a["pet_name"], "score": a["prob"], "date": a.get("date", "")}
+        return {"id": aid, "thumb": thumb, "bbox": bbox, "crop_idx": a.get("crop_idx"),
+                "pet_name": a["pet_name"], "score": a["prob"], "date": a.get("date", ""),
+                "scores": a.get("scores", []), "score_margin": a.get("score_margin"),
+                "unknown_score": a.get("unknown_score"), "runner_up_score": a.get("runner_up_score"),
+                "detection_conf": a.get("detection_conf"), "threshold": a.get("threshold"),
+                "fallback": a.get("fallback", False)}
 
     return {
         "assets": [make_item(a) for a in sorted_assets],

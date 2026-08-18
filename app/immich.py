@@ -10,7 +10,7 @@ import requests
 
 log = logging.getLogger("immich")
 
-IMMICH_URL = os.environ.get("IMMICH_URL", "http://immich-server:2283").rstrip("/")
+IMMICH_URL = os.environ.get("IMMICH_URL", "http://127.0.0.1:2283").rstrip("/")
 IMMICH_API_KEY = os.environ.get("IMMICH_API_KEY", "")
 
 # When set, this Immich tag is applied to an asset every time a face is written to it,

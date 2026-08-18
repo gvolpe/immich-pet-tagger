@@ -21,9 +21,11 @@ THRESHOLD = float(os.environ.get("THRESHOLD", 0.8))
 THRESHOLD_FALLBACK = float(os.environ.get("THRESHOLD_FALLBACK", THRESHOLD))
 """Separate, optional threshold for whole-image fallback classifications (YOLO found no
 animal to crop). Defaults to THRESHOLD itself, so leaving it unset behaves exactly like
-before this existed. The tagging accuracy tool has consistently measured the fallback
-path as a meaningfully noisier signal than a real crop (see .claude/decisions.md), this
-lets that be corrected for in live tagging, not just observed in the diagnostic."""
+before this existed. Whole-image fallback is a meaningfully noisier signal than a real
+crop, so this lets live tagging use a stricter cutoff for that path."""
+
+FALLBACK_ENABLE = os.environ.get("FALLBACK_ENABLE", "true").lower() not in {"0", "false", "no", "off"}
+"""Whether scans classify the whole image when YOLO finds no animal crop."""
 
 _count_lock = threading.Lock()
 
@@ -74,6 +76,39 @@ def classify_outcome(pet_name: str, prob: float, time_str: str, cfg: dict, thres
     return "confident"
 
 
+def _crop_animals_with_conf(img, yolo_conf):
+    try:
+        return emb.crop_animals(img, conf=yolo_conf, with_conf=True)
+    except TypeError:
+        # Tests and older call sites may monkeypatch crop_animals without the
+        # with_conf keyword; keep accepting those pair-shaped results.
+        detected = emb.crop_animals(img, conf=yolo_conf)
+        return [(bbox, crop, None) for bbox, crop in detected]
+
+
+def _classify_with_metadata(vec, names, clf, scaler) -> tuple[str, float, dict]:
+    try:
+        pet_name, prob, scores = clf_mod.classify_with_scores(vec, names, clf, scaler)
+    except Exception:
+        pet_name, prob = clf_mod.classify(vec, names, clf, scaler)
+        scores = []
+
+    clean_scores = [
+        {"name": str(s["name"]), "score": float(s["score"])}
+        for s in scores
+        if "name" in s and "score" in s
+    ]
+    unknown_score = next((s["score"] for s in clean_scores if s["name"] == "unknown"), None)
+    runner_up_score = clean_scores[1]["score"] if len(clean_scores) > 1 else None
+    margin = (float(prob) - runner_up_score) if runner_up_score is not None else None
+    return pet_name, float(prob), {
+        "scores": clean_scores,
+        "unknown_score": unknown_score,
+        "runner_up_score": runner_up_score,
+        "score_margin": margin,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Ref migration
 # ---------------------------------------------------------------------------
@@ -119,17 +154,28 @@ def migrate_ref_bboxes(data_dir: Path) -> None:
 # Main poll cycle
 # ---------------------------------------------------------------------------
 
-def run_poll_cycle(data_dir: str, on_date=None, cancel=None, low_conf_out=None, live_counts: dict | None = None, manual: bool = False, scan_until: str | None = None, scan_since: str | None = None) -> None:
+def run_poll_cycle(
+    data_dir: str,
+    on_date=None,
+    cancel=None,
+    low_conf_out=None,
+    review_out=None,
+    live_counts: dict | None = None,
+    manual: bool = False,
+    scan_until: str | None = None,
+    scan_since: str | None = None,
+    review_only: bool = False,
+) -> None:
     dd = Path(data_dir)
-    log.info(f"Poll cycle | threshold={THRESHOLD} threshold_fallback={THRESHOLD_FALLBACK} yolo_conf={det.YOLO_CONF} manual={manual}")
+    log.info(f"Poll cycle | threshold={THRESHOLD} threshold_fallback={THRESHOLD_FALLBACK} fallback_enable={FALLBACK_ENABLE} yolo_conf={det.YOLO_CONF} manual={manual} review_only={review_only}")
     now = datetime.now(timezone.utc).isoformat()
     data.write_poll_status(dd, {"status": "running", "started_at": now})
 
     counts = live_counts if live_counts is not None else {}
-    for k in ("added", "low_confidence", "unknown", "out_of_range", "already_tagged", "failed", "no_thumb"):
+    for k in ("added", "review", "low_confidence", "unknown", "out_of_range", "already_tagged", "failed", "no_thumb", "excluded", "no_animal"):
         counts[k] = 0
     try:
-        _run_poll_cycle(dd, counts, on_date, cancel, low_conf_out, manual, scan_until, scan_since)
+        _run_poll_cycle(dd, counts, on_date, cancel, low_conf_out, review_out, manual, scan_until, scan_since, review_only)
     except Exception as e:
         data.write_poll_status(dd, {"status": "error", "ran_at": datetime.now(timezone.utc).isoformat(), "error": str(e), "counts": counts})
         raise
@@ -137,7 +183,18 @@ def run_poll_cycle(data_dir: str, on_date=None, cancel=None, low_conf_out=None, 
         data.write_poll_status(dd, {"status": "idle", "ran_at": datetime.now(timezone.utc).isoformat(), "counts": counts})
 
 
-def _run_poll_cycle(dd: Path, counts: dict, on_date=None, cancel=None, low_conf_out=None, manual: bool = False, scan_until: str | None = None, scan_since: str | None = None) -> None:
+def _run_poll_cycle(
+    dd: Path,
+    counts: dict,
+    on_date=None,
+    cancel=None,
+    low_conf_out=None,
+    review_out=None,
+    manual: bool = False,
+    scan_until: str | None = None,
+    scan_since: str | None = None,
+    review_only: bool = False,
+) -> None:
     config = data.load_config(dd)
     if not config:
         log.warning("config.json empty or missing, no pets configured yet.")
@@ -158,11 +215,36 @@ def _run_poll_cycle(dd: Path, counts: dict, on_date=None, cancel=None, low_conf_
 
     log.info(f"Pets: {', '.join(f'{n}({len(refs_per_pet[n])} refs)' for n in pet_names)}")
 
-    negative_ids = data.load_negative_ids(dd)
-    if negative_ids:
-        log.info(f"Loaded {len(negative_ids)} negative samples")
+    negative_refs = data.load_negative_refs(dd)
+    if negative_refs:
+        log.info(f"Loaded {len(negative_refs)} reject samples")
+    negative_asset_set = set(data.load_negative_asset_ids(dd))
+    negative_crop_keys = {
+        key
+        for ref in negative_refs
+        if not data.is_asset_level_ref(ref)
+        for key in data.crop_ref_match_keys(ref)
+    }
+    configured_person_ids = {
+        cfg["person_id"]
+        for cfg in config.values()
+        if cfg.get("person_id")
+    }
+    ref_asset_level_ids = {
+        ref["asset_id"]
+        for refs in refs_per_pet.values()
+        for ref in refs
+        if data.is_asset_level_ref(ref)
+    }
+    ref_crop_keys = {
+        key
+        for refs in refs_per_pet.values()
+        for ref in refs
+        if not data.is_asset_level_ref(ref)
+        for key in data.crop_ref_match_keys(ref)
+    }
 
-    result = clf_mod.build_classifier(pet_names, refs_per_pet, negative_ids)
+    result = clf_mod.build_classifier(pet_names, refs_per_pet, negative_refs)
     if result is None:
         return
     names, clf, scaler = result
@@ -201,33 +283,90 @@ def _run_poll_cycle(dd: Path, counts: dict, on_date=None, cancel=None, low_conf_
         if on_date:
             on_date(time_str[:10])
 
+        if aid in negative_asset_set:
+            with _count_lock:
+                counts["excluded"] += 1
+            return
+
+        if aid in ref_asset_level_ids:
+            with _count_lock:
+                counts["already_tagged"] += 1
+            return
+
         img = emb.fetch_thumbnail(aid)
         if img is None:
             with _count_lock:
                 counts["no_thumb"] += 1
             return
-        detected = emb.crop_animals(img, conf=yolo_conf)
+        detected = _crop_animals_with_conf(img, yolo_conf)
         if not detected:
-            crops = [(None, img)]
+            if not FALLBACK_ENABLE:
+                emb.store_crops(aid, [])
+                with _count_lock:
+                    counts["no_animal"] += 1
+                return
+            crops = [(None, None, None, img)]
         else:
-            crops = detected
+            crops = [(idx, bbox, det_conf, crop) for idx, (bbox, crop, det_conf) in enumerate(detected)]
             if len(detected) > 1:
                 log.info(f"YOLO detected {len(detected)} animals in {aid} ({time_str[:10]})")
-        vecs = [(bbox_norm, emb.embed_image(crop)) for bbox_norm, crop in crops]
+        vecs = [
+            (crop_idx, bbox_norm, det_conf, emb.embed_image(crop))
+            for crop_idx, bbox_norm, det_conf, crop in crops
+        ]
 
         # Populate the crop cache so borderline and suggestions can reuse this
         # work without re-fetching and re-embedding. Only real animal crops are
         # stored; an empty list marks "no animal detected".
-        emb.store_crops(aid, [(b, v) for b, v in vecs if b is not None and v is not None])
+        emb.store_crops(aid, [(b, v) for _, b, _, v in vecs if b is not None and v is not None])
 
         existing_persons: set | None = None
         tagged_in_photo: set[str] = set()
 
-        for bbox_norm, vec in vecs:
+        def add_review_candidate(
+            pet_name: str,
+            prob: float,
+            bbox_norm,
+            crop_idx,
+            detection_conf,
+            outcome: str,
+            metadata: dict,
+            threshold_used: float,
+        ) -> None:
+            if review_out is not None:
+                review_out.append({
+                    "asset_id": aid,
+                    "pet_name": pet_name,
+                    "prob": prob,
+                    "date": time_str[:10],
+                    "bbox": list(bbox_norm) if bbox_norm is not None else None,
+                    "crop_idx": crop_idx,
+                    "detection_conf": float(detection_conf) if detection_conf is not None else None,
+                    "threshold": float(threshold_used),
+                    "fallback": bbox_norm is None,
+                    "outcome": outcome,
+                    **metadata,
+                })
+            with _count_lock:
+                counts["review"] += 1
+
+        for crop_idx, bbox_norm, detection_conf, vec in vecs:
             if vec is None:
                 continue
 
-            pet_name, prob = clf_mod.classify(vec, names, clf, scaler)
+            crop_ref = {"asset_id": aid, "crop_idx": crop_idx, "bbox": list(bbox_norm) if bbox_norm is not None else None}
+            crop_keys = data.crop_ref_match_keys(crop_ref)
+            if crop_keys & negative_crop_keys:
+                with _count_lock:
+                    counts["excluded"] += 1
+                continue
+
+            if crop_keys & ref_crop_keys:
+                with _count_lock:
+                    counts["already_tagged"] += 1
+                continue
+
+            pet_name, prob, metadata = _classify_with_metadata(vec, names, clf, scaler)
             cfg = config.get(pet_name, {})
             th = threshold if bbox_norm is not None else threshold_fallback
             outcome = classify_outcome(pet_name, prob, time_str, cfg, threshold=th)
@@ -243,10 +382,46 @@ def _run_poll_cycle(dd: Path, counts: dict, on_date=None, cancel=None, low_conf_
                 continue
 
             if outcome == "low_confidence":
+                person_id = cfg.get("person_id")
+                if review_only and person_id:
+                    if existing_persons is None:
+                        existing_persons = imm.fetch_asset_face_person_ids(aid)
+                    if person_id in existing_persons:
+                        with _count_lock:
+                            counts["already_tagged"] += 1
+                        continue
                 with _count_lock:
                     counts["low_confidence"] += 1
-                if low_conf_out is not None:
-                    low_conf_out.append({"asset_id": aid, "pet_name": pet_name, "prob": prob, "date": time_str[:10], "bbox": list(bbox_norm) if bbox_norm is not None else None})
+                if review_only:
+                    add_review_candidate(pet_name, prob, bbox_norm, crop_idx, detection_conf, outcome, metadata, th)
+                    if low_conf_out is not None:
+                        low_conf_out.append({
+                            "asset_id": aid,
+                            "pet_name": pet_name,
+                            "prob": prob,
+                            "date": time_str[:10],
+                            "bbox": list(bbox_norm) if bbox_norm is not None else None,
+                            "crop_idx": crop_idx,
+                            "detection_conf": float(detection_conf) if detection_conf is not None else None,
+                            "threshold": float(th),
+                            "fallback": bbox_norm is None,
+                            "outcome": outcome,
+                            **metadata,
+                        })
+                elif low_conf_out is not None:
+                    low_conf_out.append({
+                        "asset_id": aid,
+                        "pet_name": pet_name,
+                        "prob": prob,
+                        "date": time_str[:10],
+                        "bbox": list(bbox_norm) if bbox_norm is not None else None,
+                        "crop_idx": crop_idx,
+                        "detection_conf": float(detection_conf) if detection_conf is not None else None,
+                        "threshold": float(th),
+                        "fallback": bbox_norm is None,
+                        "outcome": outcome,
+                        **metadata,
+                    })
                 continue
 
             person_id = cfg.get("person_id")
@@ -263,6 +438,20 @@ def _run_poll_cycle(dd: Path, counts: dict, on_date=None, cancel=None, low_conf_
                 existing_persons = imm.fetch_asset_face_person_ids(aid)
 
             if person_id in existing_persons:
+                with _count_lock:
+                    counts["already_tagged"] += 1
+                continue
+
+            if review_only:
+                add_review_candidate(pet_name, prob, bbox_norm, crop_idx, detection_conf, outcome, metadata, th)
+                continue
+
+            existing_known_pets = existing_persons & configured_person_ids
+            if existing_known_pets:
+                log.info(
+                    f"Skipping {aid} -> {pet_name} ({prob:.3f}); "
+                    "asset already has another configured pet tag"
+                )
                 with _count_lock:
                     counts["already_tagged"] += 1
                 continue

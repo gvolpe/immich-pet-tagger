@@ -79,6 +79,42 @@ def test_load_negative_ids_valid(tmp_path):
     assert data.load_negative_ids(tmp_path) == ids
 
 
+def test_load_negative_refs_accepts_legacy_strings(tmp_path):
+    data.save_negative_ids(["id1", "id2"], tmp_path)
+    assert data.load_negative_refs(tmp_path) == [
+        {"asset_id": "id1"},
+        {"asset_id": "id2"},
+    ]
+
+
+def test_save_negative_refs_preserves_crop_metadata(tmp_path):
+    refs = [
+        {"asset_id": "photo1", "crop_idx": 1, "bbox": [0.1, 0.2, 0.3, 0.4]},
+        {"asset_id": "photo2"},
+    ]
+    data.save_negative_refs(refs, tmp_path)
+
+    assert data.load_negative_refs(tmp_path) == [
+        {"asset_id": "photo1", "crop_idx": 1, "bbox": [0.1, 0.2, 0.3, 0.4]},
+        {"asset_id": "photo2"},
+    ]
+    assert data.load_negative_ids(tmp_path) == ["photo1", "photo2"]
+    assert data.load_negative_asset_ids(tmp_path) == ["photo2"]
+
+
+def test_merge_crop_refs_asset_level_reject_dominates_crop_rejects():
+    refs = data.merge_crop_refs([
+        {"asset_id": "photo1", "crop_idx": 0, "bbox": [0.0, 0.0, 0.5, 0.5]},
+        {"asset_id": "photo1"},
+        {"asset_id": "photo2", "crop_idx": 0, "bbox": [0.0, 0.0, 0.5, 0.5]},
+    ])
+
+    assert refs == [
+        {"asset_id": "photo1"},
+        {"asset_id": "photo2", "crop_idx": 0, "bbox": [0.0, 0.0, 0.5, 0.5]},
+    ]
+
+
 def test_load_negative_ids_corrupted(tmp_path):
     (tmp_path / "negatives.json").write_text("not json at all")
     assert data.load_negative_ids(tmp_path) == []

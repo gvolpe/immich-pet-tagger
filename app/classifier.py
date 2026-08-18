@@ -1,21 +1,37 @@
 """Logistic regression classifier over CLIP embeddings."""
 
 import logging
+import os
 import random
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
+import data
 import embedder as emb
 
 log = logging.getLogger("classifier")
 
 
+def _negative_sample_limit() -> int | None:
+    raw = os.environ.get("NEGATIVE_SAMPLE_LIMIT", "").strip()
+    if not raw:
+        return None
+    try:
+        limit = int(raw)
+    except ValueError:
+        log.warning(f"Invalid NEGATIVE_SAMPLE_LIMIT={raw!r}; using all negatives")
+        return None
+    if limit <= 0:
+        return None
+    return limit
+
+
 def build_classifier(
     pet_names: list[str],
     refs_per_pet: dict[str, list[dict]],
-    negative_ids: list[str] | None = None,
+    negative_refs: list | None = None,
 ) -> tuple[list[str], LogisticRegression, StandardScaler] | None:
     all_vecs = []
     all_labels = []
@@ -46,15 +62,32 @@ def build_classifier(
                     log.warning(f"  Skipped ref {asset_id} for '{name}' (thumbnail unavailable)")
 
     total_refs = sum(len(refs) for refs in refs_per_pet.values())
-    if negative_ids:
-        target = total_refs * 3
-        if len(negative_ids) > target:
-            negative_ids = random.Random(0).sample(sorted(negative_ids), target)
-            log.info(f"Subsampled negatives to {target} (3x {total_refs} refs)")
+    negative_refs = data.merge_crop_refs(negative_refs or [])
+    if negative_refs:
+        limit = _negative_sample_limit()
+        if limit is not None and len(negative_refs) > limit:
+            negative_refs = random.Random(0).sample(
+                sorted(negative_refs, key=data.crop_ref_key),
+                limit,
+            )
+            log.info(f"Subsampled negatives to {limit} (NEGATIVE_SAMPLE_LIMIT; {total_refs} refs)")
+        else:
+            log.info(f"Using all {len(negative_refs)} negative samples")
 
-        log.info(f"Embedding {len(negative_ids)} negative samples...")
-        for aid in negative_ids:
-            vecs = emb.embed_asset_crops(aid)
+        log.info(f"Embedding {len(negative_refs)} negative samples...")
+        for ref in negative_refs:
+            aid = ref["asset_id"]
+            if ref.get("bbox"):
+                vec = emb.embed_crop_by_bbox(aid, ref["bbox"])
+                vecs = [vec] if vec is not None else []
+            elif ref.get("crop_idx") is not None:
+                vecs = [
+                    vec
+                    for info, vec in emb.get_crops_and_embed(aid)
+                    if info.get("crop_idx") == ref["crop_idx"]
+                ]
+            else:
+                vecs = emb.embed_asset_crops(aid)
             for vec in vecs:
                 all_vecs.append(vec)
                 all_labels.append(unknown_idx)
@@ -78,8 +111,22 @@ def build_classifier(
     return names, clf, scaler
 
 
-def classify(vec, names, clf, scaler) -> tuple[str, float]:
+def score_breakdown(vec, names, clf, scaler) -> list[dict]:
     v = np.asarray(vec, dtype=np.float64).reshape(1, -1)
     probs = clf.predict_proba(scaler.transform(v))[0]
-    i = int(np.argmax(probs))
-    return names[i], float(probs[i])
+    return [
+        {"name": name, "score": float(prob)}
+        for name, prob in sorted(zip(names, probs), key=lambda item: -item[1])
+    ]
+
+
+def classify_with_scores(vec, names, clf, scaler) -> tuple[str, float, list[dict]]:
+    scores = score_breakdown(vec, names, clf, scaler)
+    top = scores[0]
+    return top["name"], top["score"], scores
+
+
+def classify(vec, names, clf, scaler) -> tuple[str, float]:
+    scores = score_breakdown(vec, names, clf, scaler)
+    top = scores[0]
+    return top["name"], top["score"]

@@ -17,6 +17,7 @@ YOLO_BATCH_SIZE = int(os.environ.get("YOLO_BATCH_SIZE", 32))
 YOLO_WORKERS = int(os.environ.get("GPU_WORKERS", 2))
 YOLO_INPUT_SIZE = int(os.environ.get("YOLO_INPUT_SIZE", 640))
 YOLO_MODEL_NAME = os.environ.get("YOLO_MODEL_NAME", "yolov8n.pt")
+YOLO_DEVICE = os.environ.get("YOLO_DEVICE", "auto").strip()
 YOLO_CONF = float(os.environ.get("YOLO_CONF", 0.25))
 IOU_THRESHOLD = float(os.environ.get("IOU_THRESHOLD", 0.7))
 
@@ -65,6 +66,15 @@ _yolo_worker_ready = threading.Event()
 _yolo_load_error: str | None = None
 
 
+def _select_yolo_device() -> str:
+    if not YOLO_DEVICE or YOLO_DEVICE == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if YOLO_DEVICE.startswith("cuda") and not torch.cuda.is_available():
+        log.warning(f"YOLO_DEVICE={YOLO_DEVICE} requested but CUDA/ROCm is unavailable; using CPU")
+        return "cpu"
+    return YOLO_DEVICE
+
+
 def is_yolo_ready() -> bool:
     return _yolo_worker_ready.is_set()
 
@@ -76,7 +86,7 @@ def get_yolo_error() -> str | None:
 def _yolo_batch_loop(worker_id: int) -> None:
     global yolo_batch_total, yolo_batch_count, _yolo_load_error
     from ultralytics import YOLO
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _select_yolo_device()
     log.info(f"YOLO worker {worker_id} loading on {device}...")
     try:
         model = YOLO(YOLO_MODEL_NAME)
@@ -86,8 +96,8 @@ def _yolo_batch_loop(worker_id: int) -> None:
         log.error(
             f"YOLO worker {worker_id} failed to load: {e}. "
             "On first start the model is downloaded (~6 MB). "
-            "Ensure the container has internet access, then restart. "
-            "Alternatively, copy yolov8n.pt into the data volume manually."
+            "Ensure the service has internet access, then restart. "
+            "Alternatively, place the YOLO weights in the service data directory manually."
         )
         return
     _yolo_worker_ready.set()

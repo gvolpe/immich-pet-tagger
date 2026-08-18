@@ -32,8 +32,20 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 3600))
-DATA_DIR = os.environ.get("DATA_DIR", "/data")
+DATA_DIR = os.environ.get("DATA_DIR", "/var/lib/immich-pet-tagger")
 LONG_REQUEST_TIMEOUT = int(os.environ.get("LONG_REQUEST_TIMEOUT", 120))
+BIND_HOST = os.environ.get("BIND_HOST", "0.0.0.0")
+BIND_PORT = int(os.environ.get("BIND_PORT", 2287))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+BACKGROUND_POLL_ENABLED = _env_bool("BACKGROUND_POLL_ENABLED", True)
 
 
 async def polling_loop():
@@ -57,13 +69,16 @@ async def polling_loop():
 async def lifespan(app: FastAPI):
     state.init()
     load_embed_cache(Path(DATA_DIR))
-    task = asyncio.create_task(polling_loop())
+    task = asyncio.create_task(polling_loop()) if BACKGROUND_POLL_ENABLED else None
+    if task is None:
+        log.info("Background poller disabled. Automatic scans must be triggered externally.")
     yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Immich Pet Tagger", lifespan=lifespan)
@@ -81,6 +96,7 @@ async def health():
 async def status():
     return {
         "poll_interval": POLL_INTERVAL,
+        "background_poll_enabled": BACKGROUND_POLL_ENABLED,
         "data_dir": DATA_DIR,
         "immich_url": os.environ.get("IMMICH_URL", "not set"),
         "yolo_ready": det.is_yolo_ready(),
@@ -102,16 +118,11 @@ async def root():
     return FileResponse(str(BASE_DIR / "static" / "index.html"), headers=NO_CACHE_HEADERS)
 
 
-@app.get("/accuracy.html")
-async def accuracy_page():
-    return FileResponse(str(BASE_DIR / "static" / "accuracy.html"), headers=NO_CACHE_HEADERS)
-
-
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
-        port=8000,
+        host=BIND_HOST,
+        port=BIND_PORT,
         reload=False,
         log_level="info",
         timeout_keep_alive=LONG_REQUEST_TIMEOUT,

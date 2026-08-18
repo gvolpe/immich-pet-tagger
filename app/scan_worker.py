@@ -5,7 +5,7 @@ writing newline-delimited JSON progress/result messages to stdout. Logging
 goes to stderr so it doesn't interleave with the stdout protocol. Loading
 YOLO/CLIP here means the models, and all the RAM/VRAM they hold, are released
 to the OS the moment this process exits, instead of lingering in the
-long-lived web server process for the life of the container.
+long-lived web server process between scans.
 """
 
 import json
@@ -48,6 +48,7 @@ def main() -> int:
         migrate_ref_bboxes(Path(data_dir))
 
     low_conf_out: list = []
+    review_out: list = []
     live_counts: dict = {}
 
     def on_date(date_str):
@@ -66,10 +67,12 @@ def main() -> int:
             data_dir,
             on_date=on_date,
             low_conf_out=low_conf_out,
+            review_out=review_out,
             live_counts=live_counts,
             manual=args.get("manual", False),
             scan_until=args.get("scan_until"),
             scan_since=args.get("scan_since"),
+            review_only=args.get("review_only", False),
         )
     except Exception as e:
         _emit({"type": "error", "error": str(e)})
@@ -78,7 +81,7 @@ def main() -> int:
         stop_reporting.set()
         reporter.join(timeout=5)
 
-    _emit({"type": "done", "counts": live_counts, "low_conf": low_conf_out})
+    _emit({"type": "done", "counts": live_counts, "low_conf": low_conf_out, "review": review_out})
     return 0
 
 

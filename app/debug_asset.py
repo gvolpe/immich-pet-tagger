@@ -1,31 +1,30 @@
 """Classify one or more assets and show the full probability breakdown.
 
 Usage:
-    docker compose exec immich-pet-tagger python debug_asset.py <asset_id> [asset_id ...]
+    DATA_DIR=/var/lib/immich-pet-tagger python app/debug_asset.py <asset_id> [asset_id ...]
 
 The classifier is cached to disk and only rebuilt when refs or negatives change.
 """
 
 import hashlib
+import os
 import pickle
 import sys
 from pathlib import Path
-
-import numpy as np
 
 import classifier as clf_mod
 import data
 import embedder as emb
 
-DATA_DIR = Path("/data")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/var/lib/immich-pet-tagger"))
 CACHE_FILE = DATA_DIR / "debug_clf_cache.pkl"
 
 
-def _fingerprint(pet_names, refs_per_pet, negative_ids):
+def _fingerprint(pet_names, refs_per_pet, negative_refs):
     parts = []
     for name in sorted(pet_names):
-        parts.append(name + ":" + ",".join(sorted(r["asset_id"] for r in refs_per_pet[name])))
-    parts.append("neg:" + ",".join(sorted(negative_ids)))
+        parts.append(name + ":" + ",".join(sorted(data.crop_ref_key(r) for r in refs_per_pet[name])))
+    parts.append("neg:" + ",".join(sorted(data.crop_ref_key(r) for r in data.merge_crop_refs(negative_refs))))
     return hashlib.md5("\n".join(parts).encode()).hexdigest()
 
 
@@ -37,9 +36,9 @@ def load_or_build_classifier():
         for n in pet_names
     }
     pet_names = [n for n in pet_names if refs_per_pet.get(n)]
-    negative_ids = data.load_negative_ids(DATA_DIR)
+    negative_refs = data.load_negative_refs(DATA_DIR)
 
-    fp = _fingerprint(pet_names, refs_per_pet, negative_ids)
+    fp = _fingerprint(pet_names, refs_per_pet, negative_refs)
 
     if CACHE_FILE.exists():
         cached = pickle.loads(CACHE_FILE.read_bytes())
@@ -48,7 +47,7 @@ def load_or_build_classifier():
             return cached["names"], cached["clf"], cached["scaler"]
 
     print("Building classifier...")
-    result = clf_mod.build_classifier(pet_names, refs_per_pet, negative_ids)
+    result = clf_mod.build_classifier(pet_names, refs_per_pet, negative_refs)
     if result is None:
         print("Could not build classifier.")
         sys.exit(1)
@@ -72,8 +71,8 @@ def main():
         if vec is None:
             print("  no embedding (thumbnail unavailable)")
             continue
-        probs = clf.predict_proba(scaler.transform(np.asarray(vec).reshape(1, -1)))[0]
-        for name, prob in sorted(zip(names, probs), key=lambda x: -x[1]):
+        for item in clf_mod.score_breakdown(vec, names, clf, scaler):
+            name, prob = item["name"], item["score"]
             bar = "#" * int(prob * 40)
             print(f"  {name:20s} {prob:.4f}  {bar}")
 

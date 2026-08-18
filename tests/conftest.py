@@ -1,4 +1,4 @@
-"""Stub out heavy ML packages so tests run without the Docker environment."""
+"""Stub out heavy ML packages so tests run without the full inference environment."""
 import sys
 import types
 

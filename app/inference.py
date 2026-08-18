@@ -15,6 +15,7 @@ Two different memory strategies for two different usage patterns:
 """
 
 import ctypes
+import fcntl
 import gc
 import json
 import logging
@@ -23,6 +24,7 @@ import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+from time import sleep
 
 import torch
 
@@ -83,12 +85,33 @@ def inference_session():
 _SCAN_WORKER = str(Path(__file__).parent / "scan_worker.py")
 
 
+@contextmanager
+def _scan_lock(data_dir: str, cancel: threading.Event | None = None):
+    """Serialize scans across the web service and systemd timer service."""
+    lock_path = Path(data_dir) / ".scan.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w", encoding="utf-8") as lock_file:
+        while True:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if cancel is not None and cancel.is_set():
+                    raise RuntimeError("scan cancelled before start")
+                sleep(0.2)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def run_scan(data_dir: str, *, manual: bool = False, scan_until: str | None = None,
              scan_since: str | None = None, migrate: bool = False,
-             cancel: threading.Event | None = None, on_date=None, on_counts=None) -> tuple[dict, list]:
+             cancel: threading.Event | None = None, on_date=None, on_counts=None,
+             review_only: bool = False) -> tuple[dict, list, list]:
     """Run one poll cycle in an isolated subprocess, blocking until it finishes.
 
-    Returns (counts, low_conf_assets). Raises RuntimeError on failure. If
+    Returns (counts, low_conf_assets, review_assets). Raises RuntimeError on failure. If
     `cancel` is set while running, the subprocess is terminated."""
     args = {
         "data_dir": data_dir,
@@ -96,59 +119,61 @@ def run_scan(data_dir: str, *, manual: bool = False, scan_until: str | None = No
         "scan_until": scan_until,
         "scan_since": scan_since,
         "migrate": migrate,
+        "review_only": review_only,
     }
-    proc = subprocess.Popen(
-        [sys.executable, _SCAN_WORKER],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1,
-    )
-    proc.stdin.write(json.dumps(args))
-    proc.stdin.close()
+    with _scan_lock(data_dir, cancel=cancel):
+        proc = subprocess.Popen(
+            [sys.executable, _SCAN_WORKER],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+        proc.stdin.write(json.dumps(args))
+        proc.stdin.close()
 
-    def watch_cancel():
-        while proc.poll() is None:
-            if cancel.wait(timeout=0.2):
+        def watch_cancel():
+            while proc.poll() is None:
+                if cancel.wait(timeout=0.2):
+                    proc.terminate()
+                    return
+
+        if cancel is not None:
+            threading.Thread(target=watch_cancel, daemon=True).start()
+
+        def relay_stderr():
+            for line in proc.stderr:
+                sys.stderr.write(line)
+
+        stderr_thread = threading.Thread(target=relay_stderr, daemon=True)
+        stderr_thread.start()
+
+        result: dict = {}
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                t = msg.get("type")
+                if t == "date" and on_date:
+                    on_date(msg["date"])
+                elif t == "counts" and on_counts:
+                    on_counts(msg["counts"])
+                elif t in ("done", "error"):
+                    result = msg
+        except Exception:
+            # Reading the protocol itself failed unexpectedly; don't leave the
+            # worker running. On normal completion (EOF), just wait below instead:
+            # the process may still be a few milliseconds into CUDA teardown.
+            if proc.poll() is None:
                 proc.terminate()
-                return
+            raise
+        finally:
+            code = proc.wait()
+            stderr_thread.join(timeout=5)
 
-    if cancel is not None:
-        threading.Thread(target=watch_cancel, daemon=True).start()
-
-    def relay_stderr():
-        for line in proc.stderr:
-            sys.stderr.write(line)
-
-    stderr_thread = threading.Thread(target=relay_stderr, daemon=True)
-    stderr_thread.start()
-
-    result: dict = {}
-    try:
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            t = msg.get("type")
-            if t == "date" and on_date:
-                on_date(msg["date"])
-            elif t == "counts" and on_counts:
-                on_counts(msg["counts"])
-            elif t in ("done", "error"):
-                result = msg
-    except Exception:
-        # Reading the protocol itself failed unexpectedly; don't leave the
-        # worker running. On normal completion (EOF), just wait below instead:
-        # the process may still be a few milliseconds into CUDA teardown.
-        if proc.poll() is None:
-            proc.terminate()
-        raise
-    finally:
-        code = proc.wait()
-        stderr_thread.join(timeout=5)
-
-    if code != 0:
-        raise RuntimeError(result.get("error") or f"scan worker exited with code {code}")
-    return result.get("counts", {}), result.get("low_conf", [])
+        if code != 0:
+            raise RuntimeError(result.get("error") or f"scan worker exited with code {code}")
+        return result.get("counts", {}), result.get("low_conf", []), result.get("review", [])

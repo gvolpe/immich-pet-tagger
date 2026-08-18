@@ -107,7 +107,7 @@ def _clip_batch_loop(worker_id: int) -> None:
         log.error(
             f"CLIP worker {worker_id} failed to load: {e}. "
             "On first start the CLIP model is downloaded (~350 MB). "
-            "Ensure the container has internet access, then restart."
+            "Ensure the service has internet access, then restart."
         )
         return
     if not _clip_preprocess_ready.is_set():
@@ -378,14 +378,13 @@ def get_crops_and_embed(asset_id: str) -> list[tuple[dict, np.ndarray]]:
 def embed_crop_by_bbox(asset_id: str, bbox: list) -> np.ndarray | None:
     """Embed a specific crop by normalized bounding box. Used for crop-centric refs."""
     global _cache_dirty
+    cache_key = asset_id + "#bbox:" + ",".join(f"{float(v):.6f}" for v in bbox)
     with _cache_lock:
-        cached = _embed_cache.get(asset_id)
+        cached = _embed_cache.get(cache_key)
         if cached is not None:
-            _embed_cache.move_to_end(asset_id)
+            _embed_cache.move_to_end(cache_key)
     if cached is not None:
-        vecs = cached if isinstance(cached, list) else [cached]
-        if len(vecs) == 1:
-            return vecs[0]
+        return cached
     img = fetch_thumbnail(asset_id)
     if img is None:
         return None
@@ -395,8 +394,8 @@ def embed_crop_by_bbox(asset_id: str, bbox: list) -> np.ndarray | None:
     vec = embed_image(crop_img)
     if vec is not None:
         with _cache_lock:
-            _embed_cache[asset_id] = vec
-            _embed_cache.move_to_end(asset_id)
+            _embed_cache[cache_key] = vec
+            _embed_cache.move_to_end(cache_key)
             if len(_embed_cache) > MAX_EMBED_CACHE_SIZE:
                 _embed_cache.popitem(last=False)
             _cache_dirty = True

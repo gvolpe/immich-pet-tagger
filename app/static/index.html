@@ -4,19 +4,22 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Immich Pet Tagger</title>
-<link rel="stylesheet" href="/static/style.css?v=3">
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="stylesheet" href="/static/style.css?v=7">
 </head>
 <body>
 <div class="models-banner" id="modelsBanner"></div>
 <div class="shell">
   <div class="sidebar">
     <div class="sidebar-header">
-      <div>
-        <div class="logo">Pet Tagger <span id="versionLabel" style="font-size:11px;font-weight:400;color:var(--text3);vertical-align:middle;text-transform:none;"></span></div>
-        <div class="logo-sub">for Immich</div>
+      <div class="brand">
+        <img class="brand-mark" src="/static/logo.svg" alt="" width="36" height="36" aria-hidden="true">
+        <div class="brand-copy">
+          <div class="logo">Pet Tagger <span id="versionLabel" class="version-label" hidden></span></div>
+          <div class="logo-sub">for Immich</div>
+        </div>
       </div>
-      <a class="info-btn" href="/accuracy.html" title="Tagging accuracy" style="margin-right:6px; text-decoration:none;">&#128202;</a>
-      <button class="info-btn" onclick="showGuide()" title="Getting started">i</button>
+      <button class="info-btn" onclick="showGuide()" title="Show guide">i</button>
     </div>
     <div class="pets-list" id="petsList"></div>
     <button class="add-pet-btn add-pet-btn-primary" onclick="openAddPet()">+ Add pet</button>
@@ -44,7 +47,7 @@
             <span id="selCount" style="font-size:12px; color:var(--text3);"></span>
             <button class="btn btn-primary" id="assignBtn" onclick="assignSelected()" style="display:none" title="Clear, close-up shot, your pet is the only subject.">Add to pet</button>
             <button class="btn" id="skipBtn" onclick="skipSelected()" style="display:none" title="Blurry, distant, another person or animal visible alongside your pet, or a look-alike that is not yours. Ignored photos won't appear again.">Ignore</button>
-            <button class="btn btn-danger" id="addNegBtn" onclick="addSelectedAsNegatives()" style="display:none" title="Photos that could confuse the classifier. Empty rooms, other species, ambiguous shots. Around 50 is enough.">Not a pet</button>
+            <button class="btn btn-danger" id="addNegBtn" onclick="addSelectedAsNegatives()" style="display:none" title="Anything that should not be tagged as one of your configured pets: other animals, look-alikes, false detections, or ambiguous crops.">Not my pet</button>
             <div id="scanPetBtns" style="display:none; gap:4px; flex-wrap:wrap;"></div>
           </div>
         </div>
@@ -67,7 +70,7 @@
         </div>
         <div class="neg-panel">
           <div class="neg-header">
-            <span style="font-size:11px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase; color:var(--text3);">Not a pet <span style="font-weight:400;" id="negCount">0</span></span>
+            <span style="font-size:11px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase; color:var(--text3);">Not my pet <span style="font-weight:400;" id="negCount">0</span></span>
             <div style="display:flex; gap:6px; align-items:center;">
               <button class="btn" id="findNegsBtn" onclick="viewNegCandidates()" style="font-size:12px; padding:5px 10px;">Find candidates</button>
               <button class="btn" id="addNegByIdBtn" onclick="openAddNegById()" style="font-size:12px; padding:5px 10px;">Add manually</button>
@@ -223,8 +226,26 @@
   </div>
 </div>
 
-<div class="toast" id="toast"></div>
+<div class="modal-backdrop" id="confirmActionModal">
+  <div class="modal">
+    <h2 id="confirmActionTitle">Confirm action</h2>
+    <div class="modal-warning" id="confirmActionMessage"></div>
+    <div class="modal-actions">
+      <button class="btn" id="confirmActionCancel">Cancel</button>
+      <button class="btn btn-danger" id="confirmActionConfirm">Confirm</button>
+    </div>
+  </div>
+</div>
 
-<script src="/static/app.js?v=3"></script>
+<div class="toast" id="toast"></div>
+<div class="busy-overlay" id="busyOverlay" aria-hidden="true" role="status" aria-live="polite">
+  <div class="busy-panel">
+    <span class="busy-spinner"></span>
+    <div class="busy-title" id="busyOverlayTitle">Working...</div>
+    <div class="busy-detail" id="busyOverlayDetail">Applying changes</div>
+  </div>
+</div>
+
+<script type="module" src="/static/app.js?v=13"></script>
 </body>
 </html>

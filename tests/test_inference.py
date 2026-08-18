@@ -83,29 +83,31 @@ def _run_with_stub(tmp_path, monkeypatch, stub_body, **kwargs):
 
 def test_run_scan_returns_counts_and_relays_progress(tmp_path, monkeypatch):
     dates, counts_seen = [], []
-    counts, low_conf = _run_with_stub(
+    counts, low_conf, review = _run_with_stub(
         tmp_path, monkeypatch,
         'print(json.dumps({"type": "date", "date": "2026-01-01"}))\n'
         'print(json.dumps({"type": "counts", "counts": {"added": 1}}))\n'
-        'print(json.dumps({"type": "done", "counts": {"added": 2}, "low_conf": [{"id": "a"}]}))\n',
+        'print(json.dumps({"type": "done", "counts": {"added": 2}, "low_conf": [{"id": "a"}], "review": [{"id": "b"}]}))\n',
         manual=True, scan_since="2026-01-01T00:00:00.000Z",
         on_date=dates.append, on_counts=counts_seen.append,
     )
     assert counts == {"added": 2}
     assert low_conf == [{"id": "a"}]
+    assert review == [{"id": "b"}]
     assert dates == ["2026-01-01"]
     assert counts_seen == [{"added": 1}]
 
 
 def test_run_scan_passes_args_on_stdin(tmp_path, monkeypatch):
-    counts, _ = _run_with_stub(
+    counts, _, _ = _run_with_stub(
         tmp_path, monkeypatch,
         'print(json.dumps({"type": "done", "counts": args, "low_conf": []}))\n',
-        manual=True, scan_until="2026-02-01", migrate=True,
+        manual=True, scan_until="2026-02-01", migrate=True, review_only=True,
     )
     assert counts["manual"] is True
     assert counts["scan_until"] == "2026-02-01"
     assert counts["migrate"] is True
+    assert counts["review_only"] is True
     assert counts["data_dir"] == str(tmp_path)
 
 

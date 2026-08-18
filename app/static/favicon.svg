@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">Immich Pet Tagger</title>
+  <desc id="desc">A photo tag with a paw print.</desc>
+  <defs>
+    <linearGradient id="tag-fill" x1="12" y1="8" x2="52" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8b7cfb"/>
+      <stop offset="1" stop-color="#3da87a"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#tag-fill)" d="M12 12c0-3.3 2.7-6 6-6h17.3c1.6 0 3.1.6 4.2 1.8l15.7 15.7c2.3 2.3 2.3 6.1 0 8.5L32 55.2c-2.3 2.3-6.1 2.3-8.5 0L7.8 39.5C6.6 38.4 6 36.9 6 35.3V18c0-3.3 2.7-6 6-6Z"/>
+  <circle cx="22" cy="22" r="4" fill="#fff" opacity=".95"/>
+  <g fill="#fff">
+    <ellipse cx="33.5" cy="29" rx="4.1" ry="5.1" transform="rotate(-18 33.5 29)"/>
+    <ellipse cx="24.9" cy="32.1" rx="3.4" ry="4.3" transform="rotate(-31 24.9 32.1)"/>
+    <ellipse cx="42.2" cy="32.1" rx="3.4" ry="4.3" transform="rotate(31 42.2 32.1)"/>
+    <ellipse cx="29" cy="22.7" rx="3" ry="3.9" transform="rotate(-8 29 22.7)"/>
+    <ellipse cx="38.1" cy="22.7" rx="3" ry="3.9" transform="rotate(8 38.1 22.7)"/>
+    <path d="M33.5 34.1c-5.8 0-10.1 4.8-10.1 9.2 0 2.8 2.4 4.5 5 3.5 1.9-.7 3.1-1.1 5.1-1.1 2.1 0 3.2.4 5.1 1.1 2.7 1 5-.7 5-3.5 0-4.4-4.3-9.2-10.1-9.2Z"/>
+  </g>
+</svg>
