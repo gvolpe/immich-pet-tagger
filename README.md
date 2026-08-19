@@ -260,6 +260,7 @@ Configure runtime behavior through `services.immich-pet-tagger`. The most useful
 | `gpu.workers` | Parallel YOLO and CLIP inference workers. |
 | `gpu.rocm.gfxOverride` | Optional `HSA_OVERRIDE_GFX_VERSION`, useful for RX 7800 XT / gfx1101 systems. |
 | `models.yolo.name` | YOLO model name or weights path. |
+| `models.yolo.classes` | YOLO animal classes accepted as candidate pet crops. Use `[ "cat" ]` for cat-only libraries. |
 | `models.yolo.device` | PyTorch device for YOLO detection, e.g. `"cpu"` to avoid ROCm `torchvision::nms` issues while CLIP still uses ROCm. |
 | `models.yolo.inputSize` | YOLO input resolution. |
 | `models.yolo.confidence` | Minimum YOLO detection confidence. |
@@ -290,6 +291,7 @@ services.immich-pet-tagger = {
   models = {
     yolo = {
       name = "yolov8s.pt";
+      classes = [ "cat" ];
     };
     clip = {
       name = "ViT-L-14";
@@ -312,7 +314,7 @@ Embedding caches are namespaced per model combo, so switching is safe and revers
 Immich only shows people with at least one face assigned. Add at least one reference photo and wait for a poll cycle.
 
 **Low accuracy / wrong pet tagged**
-Add more reference photos, add more "not my pet" samples, or raise the relevant threshold in the NixOS module.
+Add more reference photos, add more "not my pet" samples, or raise the relevant threshold in the NixOS module. If all configured pets are cats, set `models.yolo.classes = [ "cat" ];` so birds, dogs, horses, and other animals never enter the pet classifier.
 
 **Service can't reach Immich**
 Make sure `services.immich-pet-tagger.immichUrl` points at an Immich URL reachable from the NixOS host.

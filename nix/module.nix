@@ -100,6 +100,9 @@ let
   // optionalAttrs (cfg.models.yolo.confidence != null) {
     YOLO_CONF = toString cfg.models.yolo.confidence;
   }
+  // optionalAttrs (cfg.models.yolo.classes != null) {
+    YOLO_CLASSES = lib.concatStringsSep "," cfg.models.yolo.classes;
+  }
   // optionalAttrs (cfg.classifier.maxNegativeSamples != null) {
     NEGATIVE_SAMPLE_LIMIT = toString cfg.classifier.maxNegativeSamples;
   }
@@ -251,6 +254,28 @@ in
         };
       };
       yolo = {
+        classes = mkOption {
+          default = null;
+          description = ''
+            YOLO COCO animal classes accepted as candidate pet crops. Defaults
+            to all supported animal classes. Set to `[ "cat" ]` when all
+            configured pets are cats, so birds, dogs, horses, and other animals
+            never enter the pet classifier.
+          '';
+          example = [ "cat" ];
+          type = types.nullOr (types.listOf (types.enum [
+            "bird"
+            "cat"
+            "dog"
+            "horse"
+            "sheep"
+            "cow"
+            "elephant"
+            "bear"
+            "zebra"
+            "giraffe"
+          ]));
+        };
         confidence = mkOption {
           default = null;
           description = "Minimum YOLO detection confidence.";

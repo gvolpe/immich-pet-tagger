@@ -1,6 +1,19 @@
 import detector
 
 
+def test_parse_yolo_classes_defaults_to_supported_animals():
+    assert detector._parse_yolo_classes(None) == set(detector.COCO_ANIMAL_CLASS_IDS.values())
+    assert detector._parse_yolo_classes("") == set(detector.COCO_ANIMAL_CLASS_IDS.values())
+
+
+def test_parse_yolo_classes_accepts_names_and_numeric_ids():
+    assert detector._parse_yolo_classes("cat,dog,14") == {15, 16, 14}
+
+
+def test_parse_yolo_classes_falls_back_when_no_valid_class():
+    assert detector._parse_yolo_classes("not-a-class") == set(detector.COCO_ANIMAL_CLASS_IDS.values())
+
+
 def test_select_yolo_device_auto_uses_cpu_without_cuda(monkeypatch):
     monkeypatch.setattr(detector, "YOLO_DEVICE", "auto")
     monkeypatch.setattr(detector.torch.cuda, "is_available", lambda: False)

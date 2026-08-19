@@ -8,6 +8,7 @@ import queue
 import re
 import sqlite3
 import threading
+import warnings
 from collections import OrderedDict
 from pathlib import Path
 
@@ -27,9 +28,29 @@ SCAN_WORKERS = int(os.environ.get("SCAN_WORKERS", _default_scan_workers))
 CLIP_BATCH_SIZE = int(os.environ.get("CLIP_BATCH_SIZE", 32))
 CLIP_MODEL_NAME = os.environ.get("CLIP_MODEL_NAME", "ViT-B-16")
 CLIP_PRETRAINED = os.environ.get("CLIP_PRETRAINED", "openai")
-_DEFAULT_CLIP_MODEL_NAME = "ViT-B-16"
-_DEFAULT_CLIP_PRETRAINED = "openai"
-_DEFAULT_YOLO_MODEL_NAME = "yolov8n.pt"
+
+
+class _DropHfUnauthenticatedWarning(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "unauthenticated requests to the HF Hub" not in record.getMessage()
+
+
+logging.getLogger("huggingface_hub.utils._http").addFilter(_DropHfUnauthenticatedWarning())
+warnings.filterwarnings("ignore", message=r".*unauthenticated requests to the HF Hub.*")
+
+
+def _clip_force_quick_gelu(model_name: str, pretrained: str | None) -> bool:
+    """OpenAI CLIP weights were trained with QuickGELU.
+    OpenCLIP exposes this as a flag for base model names like ViT-L-14."""
+    if pretrained is None or pretrained.strip().lower() != "openai":
+        return False
+    return "quickgelu" not in model_name.lower()
+
+
+CLIP_FORCE_QUICK_GELU = _clip_force_quick_gelu(CLIP_MODEL_NAME, CLIP_PRETRAINED)
+CLIP_CACHE_MODEL_NAME = (
+    f"{CLIP_MODEL_NAME}-quickgelu" if CLIP_FORCE_QUICK_GELU else CLIP_MODEL_NAME
+)
 
 MAX_EMBED_CACHE_SIZE = int(os.environ.get("EMBED_CACHE_SIZE", 5000))
 _embed_cache: OrderedDict[str, list[np.ndarray]] = OrderedDict()
@@ -100,7 +121,13 @@ def _clip_batch_loop(worker_id: int) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info(f"CLIP worker {worker_id} loading on {device}...")
     try:
-        model, preprocess, _ = open_clip.create_model_and_transforms(CLIP_MODEL_NAME, pretrained=CLIP_PRETRAINED)
+        if CLIP_FORCE_QUICK_GELU:
+            log.info(f"CLIP worker {worker_id} using QuickGELU for {CLIP_MODEL_NAME}/{CLIP_PRETRAINED}")
+        model, preprocess, _ = open_clip.create_model_and_transforms(
+            CLIP_MODEL_NAME,
+            pretrained=CLIP_PRETRAINED,
+            force_quick_gelu=CLIP_FORCE_QUICK_GELU,
+        )
         model.eval().to(device)
     except Exception as e:
         _clip_load_error = str(e)
@@ -406,16 +433,17 @@ def _cache_suffix() -> str:
     """Cache files are namespaced by model so switching CLIP_MODEL_NAME/CLIP_PRETRAINED or
     YOLO_MODEL_NAME can't silently mix embeddings or crop boxes from different vector spaces
     or detectors. embeddings.pkl and crops.db both store crops of whatever YOLO detects, then
-    CLIP-embeds them, so both models are part of the cache key. The default combo keeps the
-    original unsuffixed filenames so existing installs don't lose their cache."""
+    CLIP-embeds them, so both models are part of the cache key. CLIP_CACHE_MODEL_NAME includes
+    activation overrides that affect embeddings. A custom YOLO class allow-list also changes
+    which crops exist, so it is part of the crop/embedding namespace."""
     import detector as _det
-    if (
-        CLIP_MODEL_NAME == _DEFAULT_CLIP_MODEL_NAME
-        and CLIP_PRETRAINED == _DEFAULT_CLIP_PRETRAINED
-        and _det.YOLO_MODEL_NAME == _DEFAULT_YOLO_MODEL_NAME
-    ):
-        return ""
-    raw = f"{CLIP_MODEL_NAME}_{CLIP_PRETRAINED}_{_det.YOLO_MODEL_NAME}"
+    yolo_classes = getattr(_det, "ANIMAL_CLASS_IDS", set())
+    default_yolo_classes = set(getattr(_det, "COCO_ANIMAL_CLASS_IDS", {}).values())
+    class_suffix = ""
+    if yolo_classes and yolo_classes != default_yolo_classes:
+        class_names = _det._class_names_for_ids(yolo_classes)
+        class_suffix = "_classes_" + "_".join(class_names)
+    raw = f"{CLIP_CACHE_MODEL_NAME}_{CLIP_PRETRAINED}_{_det.YOLO_MODEL_NAME}{class_suffix}"
     safe = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_")[:80]
     return f"_{safe}"
 

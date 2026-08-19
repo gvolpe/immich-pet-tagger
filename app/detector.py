@@ -27,18 +27,50 @@ IOU_THRESHOLD = float(os.environ.get("IOU_THRESHOLD", 0.7))
 # a second inference pass over the same image.
 _MODEL_CONF_FLOOR = 0.001
 
-ANIMAL_CLASS_IDS = {
-    14,  # bird
-    15,  # cat
-    16,  # dog
-    17,  # horse
-    18,  # sheep
-    19,  # cow
-    20,  # elephant
-    21,  # bear
-    22,  # zebra
-    23,  # giraffe
+COCO_ANIMAL_CLASS_IDS = {
+    "bird": 14,
+    "cat": 15,
+    "dog": 16,
+    "horse": 17,
+    "sheep": 18,
+    "cow": 19,
+    "elephant": 20,
+    "bear": 21,
+    "zebra": 22,
+    "giraffe": 23,
 }
+
+
+def _parse_yolo_classes(raw: str | None) -> set[int]:
+    if raw is None or not raw.strip():
+        return set(COCO_ANIMAL_CLASS_IDS.values())
+
+    class_ids: set[int] = set()
+    for token in raw.split(","):
+        value = token.strip().lower().replace("_", "-")
+        if not value:
+            continue
+        if value.isdigit():
+            class_ids.add(int(value))
+            continue
+        class_id = COCO_ANIMAL_CLASS_IDS.get(value)
+        if class_id is None:
+            log.warning(f"Unknown YOLO class {token!r}; expected one of {sorted(COCO_ANIMAL_CLASS_IDS)} or a class id")
+            continue
+        class_ids.add(class_id)
+
+    if not class_ids:
+        log.warning("YOLO_CLASSES did not contain any valid classes; using all supported animal classes")
+        return set(COCO_ANIMAL_CLASS_IDS.values())
+    return class_ids
+
+
+def _class_names_for_ids(class_ids: set[int]) -> list[str]:
+    name_by_id = {class_id: name for name, class_id in COCO_ANIMAL_CLASS_IDS.items()}
+    return [name_by_id.get(class_id, str(class_id)) for class_id in sorted(class_ids)]
+
+
+ANIMAL_CLASS_IDS = _parse_yolo_classes(os.environ.get("YOLO_CLASSES"))
 
 
 class _YoloReq:
@@ -87,7 +119,7 @@ def _yolo_batch_loop(worker_id: int) -> None:
     global yolo_batch_total, yolo_batch_count, _yolo_load_error
     from ultralytics import YOLO
     device = _select_yolo_device()
-    log.info(f"YOLO worker {worker_id} loading on {device}...")
+    log.info(f"YOLO worker {worker_id} loading on {device}; classes={','.join(_class_names_for_ids(ANIMAL_CLASS_IDS))}")
     try:
         model = YOLO(YOLO_MODEL_NAME)
         model.to(device)
