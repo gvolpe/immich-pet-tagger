@@ -18,7 +18,6 @@ let
     mkOption
     optional
     optionalAttrs
-    optionalString
     types
     ;
 
@@ -26,8 +25,6 @@ let
   timerEnabled = cfg.scan.mode == "timer";
   pollEnabled = cfg.scan.mode == "poll";
   supplementaryGroups = optional rocmEnabled "render" ++ optional rocmEnabled "video";
-  timerCalendar =
-    cfg.scan.onCalendar + optionalString (cfg.scan.timeZone != null) " ${cfg.scan.timeZone}";
 
   package =
     if cfg.gpu.package != null then
@@ -334,14 +331,16 @@ in
         description = "Seconds between background scans when `scan.mode = \"poll\"`.";
         type = types.ints.positive;
       };
-      onCalendar = mkOption {
+      schedule = mkOption {
         default = "hourly";
         description = ''
           systemd `OnCalendar` expression used when `scan.mode = "timer"`.
-          For example, `"*-*-* 05..23:30:00"` runs hourly at `:30` from 05:30
-          through 23:30 and skips the midnight-to-05:00 maintenance window.
+          A timezone may be included directly in the expression. For example,
+          `"*-*-* 05..23:30:00 Europe/Warsaw"` runs hourly at `:30` from 05:30
+          through 23:30 in `Europe/Warsaw` and skips the midnight-to-05:00
+          maintenance window.
         '';
-        example = "*-*-* 05..23:30:00";
+        example = "*-*-* 05..23:30:00 Europe/Warsaw";
         type = types.str;
       };
       persistent = mkOption {
@@ -354,15 +353,6 @@ in
         description = "Optional systemd timer jitter for scheduled scans.";
         example = "15m";
         type = types.str;
-      };
-      timeZone = mkOption {
-        default = null;
-        description = ''
-          IANA timezone name appended to the systemd `OnCalendar` expression.
-          If unset, systemd uses the host's local timezone.
-        '';
-        example = "Europe/Warsaw";
-        type = types.nullOr types.str;
       };
     };
 
@@ -451,7 +441,7 @@ in
     systemd.timers.immich-pet-tagger-scan = mkIf timerEnabled {
       description = "Immich Pet Tagger scheduled scan";
       timerConfig = {
-        OnCalendar = timerCalendar;
+        OnCalendar = cfg.scan.schedule;
         Persistent = cfg.scan.persistent;
         RandomizedDelaySec = cfg.scan.randomizedDelaySec;
         Unit = "immich-pet-tagger-scan.service";

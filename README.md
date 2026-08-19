@@ -121,8 +121,7 @@ the app as `packages.x86_64-linux.default` (CPU) and `packages.x86_64-linux.rocm
 
             scan = {
               mode = "timer";
-              onCalendar = "*-*-* 05..23:30:00";
-              timeZone = "Europe/Warsaw";
+              schedule = "*-*-* 05..23:30:00 Europe/Warsaw";
             };
           };
         }
@@ -138,7 +137,8 @@ credentials so it is not placed in the Nix store. With `scan.mode = "timer"`,
 the UI stays up continuously while scans are run by
 `immich-pet-tagger-scan.timer`; the example above runs hourly from 05:30
 through 23:30 in `Europe/Warsaw` and skips a midnight-to-05:00 maintenance
-window. If `scan.timeZone` is unset, systemd uses the host's local timezone.
+window. If no timezone is included in `scan.schedule`, systemd uses the host's
+local timezone.
 
 After adding the module configuration, rebuild and inspect the service:
 
@@ -253,8 +253,7 @@ Configure runtime behavior through `services.immich-pet-tagger`. The most useful
 | `tagName` | Optional Immich review tag applied to photos touched by the service. Set to `null` to disable. |
 | `scan.mode` | `poll`, `timer`, or `manual`. |
 | `scan.pollInterval` | Seconds between in-process background scans when `scan.mode = "poll"`. |
-| `scan.onCalendar` | systemd `OnCalendar` expression when `scan.mode = "timer"`. |
-| `scan.timeZone` | Optional IANA timezone for the systemd timer. |
+| `scan.schedule` | systemd `OnCalendar` expression when `scan.mode = "timer"`. A timezone can be included directly, e.g. `"*-*-* 05..23:30:00 Europe/Warsaw"`. |
 | `gpu.enable` | Enable GPU-specific setup. |
 | `gpu.acceleration` | GPU backend. Currently `rocm`. |
 | `gpu.workers` | Parallel YOLO and CLIP inference workers. |
